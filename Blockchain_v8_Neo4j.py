@@ -26,7 +26,7 @@
 
 
 import requests
-print(requests.__version__)
+import time
 from neo4j import GraphDatabase
 import sys
 import csv
@@ -39,13 +39,21 @@ from analisisForense import analizar_csv
 
 # DEFINICIÓN DE VARIABLES
 # Nombre instancia analisisBlockchain
-NEO4J_URI = "bolt://localhost:7687"
-#neo4j://127.0.0.1:7687
-NEO4J_USER = "neo4j"
-NEO4J_PASS = "SRFParaku26!"   # <-- Ver para encriptarla
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
+NEO4J_PASS = os.environ.get("NEO4J_PASS")
+
+if not NEO4J_PASS:
+    print("[ERROR] Variable de entorno NEO4J_PASS no definida.")
+    print("  Ejecuta: export NEO4J_PASS='tu_contraseña' antes de lanzar el script.")
+    sys.exit(1)
 
 driver = None
 csv_registrados = set()  # Para evitar duplicados en el CSV
+
+API_TIMEOUT = 15
+API_MAX_RETRIES = 3
+API_RETRY_DELAY = 2
 
 
 
@@ -92,23 +100,47 @@ def close_neo4j():
 BASE = "https://mempool.space/api"
 
 
+def _api_request(url, default=None):
+    """Petición GET con timeout, reintentos y manejo de rate-limit (429)."""
+    delay = API_RETRY_DELAY
+    for intento in range(1, API_MAX_RETRIES + 1):
+        try:
+            r = requests.get(url, timeout=API_TIMEOUT)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429:
+                retry_after = int(r.headers.get("Retry-After", delay))
+                print(f"[WARN] Rate-limit (429). Reintentando en {retry_after}s (intento {intento}/{API_MAX_RETRIES})")
+                time.sleep(retry_after)
+                delay *= 2
+                continue
+            if r.status_code >= 500:
+                print(f"[WARN] Error servidor ({r.status_code}). Reintentando en {delay}s (intento {intento}/{API_MAX_RETRIES})")
+                time.sleep(delay)
+                delay *= 2
+                continue
+            print(f"[WARN] HTTP {r.status_code} en {url}")
+            return default
+        except requests.exceptions.Timeout:
+            print(f"[WARN] Timeout. Reintentando en {delay}s (intento {intento}/{API_MAX_RETRIES})")
+            time.sleep(delay)
+            delay *= 2
+        except requests.exceptions.RequestException as e:
+            print(f"[WARN] Error de red: {e}. Reintentando en {delay}s (intento {intento}/{API_MAX_RETRIES})")
+            time.sleep(delay)
+            delay *= 2
+    print(f"[ERROR] No se pudo obtener {url} tras {API_MAX_RETRIES} intentos.")
+    return default
 
 
 def get_tx(txid):
     # Dado un txid, obtenemos el JSON de la transacción desde la API de mempool.space
-    r = requests.get(f"{BASE}/tx/{txid}?include_prevout=true")
-    if r.status_code != 200:
-        return None
-    return r.json()
-
+    return _api_request(f"{BASE}/tx/{txid}?include_prevout=true")
 
 
 def get_address_txs(address):
     # Dada una dirección, obtenemos todas las transacciones asociadas a esa dirección desde la API de mempool.space
-    r = requests.get(f"{BASE}/address/{address}/txs")
-    if r.status_code != 200:
-        return []
-    return r.json()
+    return _api_request(f"{BASE}/address/{address}/txs", default=[])
 
 
 
@@ -131,7 +163,10 @@ def trace_backward(tx_actual, visitadas=None, profundidad=0, max_profundidad=10)
         return
     visitadas.add(txid_actual)
 
-    fecha_tx_actual = tx_actual["status"]["block_time"]
+    fecha_tx_actual = tx_actual.get("status", {}).get("block_time")
+    if fecha_tx_actual is None:
+        print(f"[WARN] TX {txid_actual} no confirmada (sin block_time). Saltando backward.")
+        return
 
     print(f"\n[BACKWARD] Analizando tx {txid_actual} (fecha {fecha_tx_actual})")
 
@@ -183,7 +218,10 @@ def trace_forward(tx_actual, visitadas=None, profundidad=0, max_profundidad=10):
         return
     visitadas.add(txid_actual)
 
-    fecha_tx_actual = tx_actual["status"]["block_time"]
+    fecha_tx_actual = tx_actual.get("status", {}).get("block_time")
+    if fecha_tx_actual is None:
+        print(f"[WARN] TX {txid_actual} no confirmada (sin block_time). Saltando forward.")
+        return
 
     print(f"\n[FORWARD] Analizando tx {txid_actual} (fecha {fecha_tx_actual})")
 
@@ -212,14 +250,15 @@ def trace_forward(tx_actual, visitadas=None, profundidad=0, max_profundidad=10):
                 else:
                     addr_in = vin.get("scriptpubkey_address")
 
-                if addr_in == direccion_output and tx["status"]["block_time"] > fecha_tx_actual:
+                bt = tx.get("status", {}).get("block_time")
+                if addr_in == direccion_output and bt is not None and bt > fecha_tx_actual:
                     txs_posteriores.append(tx)
                     break
 
         if not txs_posteriores:
             continue
 
-        txs_posteriores.sort(key=lambda t: t["status"]["block_time"])
+        txs_posteriores.sort(key=lambda t: t.get("status", {}).get("block_time", 0))
 
         for tx_posterior in txs_posteriores:
             print(f"    ✔ Posterior: {tx_posterior['txid']}")
