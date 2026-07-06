@@ -1,0 +1,4 @@
+requests
+neo4j
+pandas
+python-dotenv
